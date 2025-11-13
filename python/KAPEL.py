@@ -18,11 +18,13 @@ from os import listdir, mkdir
 from os.path import isfile, join
 from pathlib import Path
 from shutil import copyfile
+from typing import Any
 
 from KAPELConfig import KAPELConfig
 from prometheus_api_client import PrometheusConnect
 from dirq.QueueSimple import QueueSimple
 import jwt
+import re
 
 # for debugging
 #import code
@@ -52,16 +54,44 @@ class QueryLogic:
         # (which takes a range and returns a scalar), and as a result get the whole metric set. Finally, use group_left for many-to-one matching.
         # https://prometheus.io/docs/prometheus/latest/querying/operators/#aggregation-operators
         # https://prometheus.io/docs/prometheus/latest/querying/operators/#many-to-one-and-one-to-many-vector-matches
-        self.cputime = f'(max_over_time(kube_pod_completion_time{{namespace="{namespace}"}}[{queryRange}]) - max_over_time(kube_pod_start_time{{namespace="{namespace}"}}[{queryRange}])) * on (pod) group_left() max by (pod, uid) (max_over_time(kube_pod_container_resource_requests{{resource="cpu", node != "", namespace="{namespace}"}}[{queryRange}]))'
+        #prefer the kube_pod_completion to fall back to kapel_pod_endtime if it's missing
+        _end_pref = (
+            f'(max_over_time(kube_pod_completion_time{{namespace="{namespace}"}}[{queryRange}]) '
+            f'or on(pod, uid, namespace) max_over_time(kapel_pod_endtime{{namespace="{namespace}"}}[{queryRange}]))'
+        )
+        #prefer the kube_pod_container_resource_requests to fall back to kapel_pod_cpu_requests if it's missing
+        _cores_pref = (
+            f'(max_over_time(kube_pod_container_resource_requests{{resource="cpu", node != "", namespace="{namespace}"}}[{queryRange}]) '
+            f'or on(pod, uid, namespace) max_over_time(kapel_pod_cpu_requests{{namespace="{namespace}"}}[{queryRange}]))'
+        )
+        
+        #Calculates each pod’s CPU time by multiplying how long it ran by its CPU cores, using exporter data if KSM metrics are missing.
+        self.cputime = (
+        f'(max by (pod, uid) ('
+        f'  (max_over_time(kube_pod_completion_time{{namespace="{namespace}"}}[{queryRange}]) '
+        f'   or on(pod, uid, namespace) max_over_time(kapel_pod_endtime{{namespace="{namespace}"}}[{queryRange}]))'
+        f') - '
+        f'max by (pod, uid) (max_over_time(kube_pod_start_time{{namespace="{namespace}"}}[{queryRange}]))) '
+        f'* on (pod, uid) group_left() '
+        f'max by (pod, uid) ('
+        f'  (max_over_time(kube_pod_container_resource_requests{{resource="cpu", node != "", namespace="{namespace}"}}[{queryRange}]) '
+        f'   or on(pod, uid, namespace) max_over_time(kapel_pod_cpu_requests{{namespace="{namespace}"}}[{queryRange}]))'
+        f')'
+        )
+
+        # self.cputime = (
+        #     f'({_end_pref} - max_over_time(kube_pod_start_time{{namespace="{namespace}"}}[{queryRange}])) '
+        #     f'* on (pod, uid) group_left() max by (pod, uid) ({_cores_pref})'
+        # )
         # These queries may produce duplicate metrics for the same pod but they get collapsed by the rearrange function.
-        self.endtime = f'max_over_time(kube_pod_completion_time{{namespace="{namespace}"}}[{queryRange}])'
+        self.endtime = _end_pref
         self.starttime = f'max_over_time(kube_pod_start_time{{namespace="{namespace}"}}[{queryRange}])'
-        self.cores = f'max_over_time(kube_pod_container_resource_requests{{resource="cpu", node != "", namespace="{namespace}"}}[{queryRange}])'
-        self.memory = f'sum by (pod) (max_over_time(kube_pod_container_resource_requests{{resource="memory", node!="", namespace="{namespace}"}}[{queryRange}])) / 1000'
+        self.cores = f'max by (pod, uid) ({_cores_pref})'
+        self.memory = f'sum by (pod, uid) (max_over_time(kube_pod_container_resource_requests{{resource="memory", node!="", namespace="{namespace}"}}[{queryRange}])) / 1000'
 
         # This is container-level CPU usage reported by kubelets, for gratia output.
         # Take the largest (i.e. final) value of the cumulative CPU usage of each container, and sum the results for all containers in a pod.
-        self.cpuusage = f'sum by (pod) (last_over_time(container_cpu_usage_seconds_total{{namespace="{namespace}"}}[{queryRange}]))'
+        self.cpuusage = f'sum by (pod, id) (last_over_time(container_cpu_usage_seconds_total{{namespace="{namespace}"}}[{queryRange}]))'
 
 def summary_message(config, year, month, wall_time, cpu_time, n_jobs, first_end, last_end):
     output = (
@@ -87,7 +117,7 @@ def summary_message(config, year, month, wall_time, cpu_time, n_jobs, first_end,
     )
     return output
 
-def individual_message(config, pod_name, memory, cores, wall_time, cpu_time, start_time, end_time):
+def individual_message(config, pod_name, job_id, memory, cores, wall_time, cpu_time, start_time, end_time):
     """ Write an APEL individual job message based on prometheus metrics from a single pod, without benchmark values. """
     output = (
         f'APEL-individual-job-message: v0.3\n'
@@ -95,7 +125,7 @@ def individual_message(config, pod_name, memory, cores, wall_time, cpu_time, sta
         f'VO: {config.vo_name}\n'
         f'SubmitHost: {config.submit_host}\n'
         f'MachineName: {pod_name}\n'
-        f'LocalJobId: {pod_name}\n'
+        f'LocalJobId: {job_id}\n'
         f'InfrastructureType: {config.infrastructure_type}\n'
         f'WallDuration: {wall_time}\n'
         f'CpuDuration: {cpu_time}\n'
@@ -178,13 +208,34 @@ def get_gap_time_periods(start, end):
     # return value is list of dicts of (int, int, datetime, int)
     return periods
 
+# Only extract the record for the top level cgroup, which should (theoretically)
+# encompass all containers
+ID_UUID_RE = re.compile(r'^/kubepods.slice/.*pod([0-9a-f_]*).slice$')
+def _extact_uid_from_cgroup(cgroup: str):
+    if match := ID_UUID_RE.match(cgroup):
+        return match[1].replace('_','-')
+    return None
+
+def filter_records_by_uid(prom_result: list[dict[str, dict[str, Any]]]):
+    # Given a list of prometheus results, attempt to determine the `uid`
+    # field for records that don't have them, then return just the records
+    # for which a UID could be determined
+    for item in prom_result:
+        metric = item['metric']
+        if 'id' in metric and not 'uid' in metric:
+            uid = _extact_uid_from_cgroup(metric['id'])
+            metric['uid'] = uid
+
+    return (item for item in prom_result if item['metric'].get('uid'))
+
 # Take a list of dicts from the prom query and construct a random-accessible dict (casting from string to float while we're at it) via generator.
-# (actually a list of tuples, so use dict() on the output) that can be referenced by the 'pod' label as a key.
-# NB: this overwrites duplicate results if we get any from the prom query!
-def rearrange(x):
-    for item in x:
+# (actually a list of tuples, so use dict() on the output) that can be referenced by the (pod, uid) label as a key.
+def group_results_by_pod_uid(prom_result: list[dict[str, Any]]):
+    for item in filter_records_by_uid(prom_result):
+        pod_key = item['metric']['pod']
+        uid_key = item['metric']['uid']
         # this produces each of the (key, value) tuples in the list
-        yield item['metric']['pod'], float(item['value'][1])
+        yield (pod_key, uid_key), float(item['value'][1])
 
 
 def record_summarized_period(config, period_start, year, month, results):
@@ -206,7 +257,7 @@ def record_summarized_period(config, period_start, year, month, results):
 
     sum_cputime = 0
     t4 = timer()
-    for key in valid_jobs:
+    for (key, uid) in valid_jobs:
         if endtime[key] < starttime[key]:
             # could happen due to inaccurate clocks?
             print(f'WARNING: ignoring job {key} with negative duration: start={starttime[key]}, end={endtime[key]}')
@@ -255,24 +306,25 @@ def record_summarized_period(config, period_start, year, month, results):
     print(f'Writing sync record to {config.output_path}/{sync_file}:')
     print('--------------------------------\n' + sync_output + '--------------------------------')
 
-def record_individual_period(config, results):
+def record_individual_period(config, results: dict[str, dict[tuple[str, str], float]]):
     """ Record each pod in the namespace over the summarized period.
     Assumes each pod ran once and terminated upon completion.
     """
     # Pivot records from {'data_type':{'pod_name':value}} to {'pod_name':{'data_type':value}}
     per_pod_records = {}
     for data_type, records in results.items():
-        for pod, val in records.items():
-            if not pod in per_pod_records:
-                per_pod_records[pod] = {}
-            per_pod_records[pod][data_type] = val
+        for (pod, uid), val in records.items():
+            if not (pod, uid) in per_pod_records:
+                per_pod_records[(pod, uid)] = {}
+            per_pod_records[(pod, uid)][data_type] = val
     
     dirq = QueueSimple(str(config.output_path))
     skipped_records = 0
-    for pod_name, records in per_pod_records.items():
+    for (pod_name, uid), records in per_pod_records.items():
         # Only report on pods that have completed. Running pods won't have an endtime
         if not ('starttime' in records and 'endtime' in records):
             continue
+
 
         # If we can't determine the processor count for a pod, skip it with a warning
         processors = records.get('cores', 0) or config.processors
@@ -283,10 +335,11 @@ def record_individual_period(config, results):
         individual_output = individual_message(
             config, 
             pod_name,
+            uid,
             records.get('memory', 0),
             processors,
             records['endtime'] - records['starttime'],
-            records.get('cpuusage', 0),
+            records.get('cputime', 0),
             records['starttime'],
             records['endtime'])
         record_file = dirq.add(individual_output)
@@ -343,7 +396,7 @@ def process_period(config, period):
         t1 = timer()
         raw_result = prom.custom_query(query=query_string, params=prom_connect_params)
         t2 = timer()
-        results[query_name] = dict(rearrange(raw_result))
+        results[query_name] = dict(group_results_by_pod_uid(raw_result))
         t3 = timer()
         print(f'Query finished in {t2 - t1} s, processed in {t3 - t2} s. Got {len(results[query_name])} items from {len(raw_result)} results. Peak RAM usage: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}K.')
 
